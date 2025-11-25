@@ -33,7 +33,7 @@ Python (PySide6) で動作する、高機能マインスイーパ・シミュレ
 
 ## 開発体制 (Credits)
 
-* **Lead Architect / Author**: [あなたの名前]
+* **Lead Architect / Author**: [にぱー]
     * 企画、コアロジック設計、UI実装、全体統括
 * **Code Assistant**: Gemini (Google)
     * コード補完、リファクタリング支援
