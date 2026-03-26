@@ -14,12 +14,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QRect, QUrl
 # 描画（ペン、ブラシ、フォント）
 from PySide6.QtGui import QPainter, QColor, QFont, QPen, QMouseEvent
-# サウンド再生
 from PySide6.QtMultimedia import QSoundEffect
-
-# 再帰処理（空白マスを一気に開ける処理）の上限を上げておく
-# デフォルトだと広いマップでクラッシュする恐れがあるため
-sys.setrecursionlimit(20000)
 
 # ==========================================
 # 言語データ (日本語 / 英語)
@@ -162,22 +157,26 @@ class SoundManager:
 # ゲーム盤面ウィジェット (描画担当)
 # ==========================================
 class BoardWidget(QWidget):
-    """
-    マインスイーパのグリッドを描画するカスタムウィジェット。
-    ボタンを大量に配置すると重くなるため、QPainterですべて描画する方式を採用。
-    """
+    """マインスイーパ盤面（画面外カリング付き）"""
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMouseTracking(True) # マウス移動イベントを検知可能に
-        self.parent_logic = None    # 親ウィンドウ（ロジック）への参照
-        
+        self.setMouseTracking(True)
+        self.parent_logic = None
+
         # グリッド設定
         self.grid_w = 20
         self.grid_h = 20
-        self.cells = []      # セルデータの2次元配列
-        self.cell_size = 20  # 1マスのピクセルサイズ（動的に変化）
-        self.offset_x = 0    # 描画開始位置X（中央寄せ用）
-        self.offset_y = 0    # 描画開始位置Y
+        self.cells = []
+        self.cell_size = 20
+        self.offset_x = 0
+        self.offset_y = 0
+
+        # ズーム・パン
+        self.zoom = 1.0
+        self.pan_x = 0
+        self.pan_y = 0
+        self._dragging = False
+        self._drag_start = None
         
         # 表示設定
         self.theme = 'Modern' 
@@ -189,15 +188,15 @@ class BoardWidget(QWidget):
         
         # --- カラーパレット定義 ---
         self.colors = {
-            'Sea': { # 海モード
-                'bg': QColor('#2c3e50'),       # 背景（深海色）
-                'sea': QColor('#2980b9'),      # 0のマス（海）
-                'sand': QColor('#e6d0a1'),     # 数字マス（砂浜）
-                'land': QColor('#27ae60'),     # 未開放（陸）
-                'mine_bg': QColor('#c0392b'),  # 爆発時の赤
-                'text_base': QColor('#5d4037') # 砂浜上の文字色
+            'Sea': {
+                'bg': QColor('#2c3e50'),
+                'sea': QColor('#2980b9'),
+                'sand': QColor('#e6d0a1'),
+                'land': QColor('#27ae60'),
+                'mine_bg': QColor('#c0392b'),
+                'text_base': QColor('#5d4037')
             },
-            'Modern': { # モダンモード（フラット）
+            'Modern': {
                 'bg': QColor('#222'),
                 'sea': QColor('#fff'),
                 'sand': QColor('#fff'),
@@ -205,14 +204,70 @@ class BoardWidget(QWidget):
                 'mine_bg': QColor('#e74c3c'),
                 'text_base': Qt.black
             },
-            'Classic': { # クラシック（Windows95風）
+            'Classic': {
                 'bg': QColor('#c0c0c0'),
                 'sea': QColor('#c0c0c0'),
                 'sand': QColor('#c0c0c0'),
                 'land': QColor('#c0c0c0'),
                 'mine_bg': QColor('red'),
                 'text_base': Qt.black
-            }
+            },
+            'Brazil': {
+                'bg': QColor('#004a17'),
+                'sea': QColor('#009c3b'),
+                'sand': QColor('#ffdf00'),
+                'land': QColor('#00a84f'),
+                'mine_bg': QColor('#d40000'),
+                'text_base': QColor('#002776')
+            },
+            'Hoover': {
+                'bg': QColor('#0a1929'),
+                'sea': QColor('#1565c0'),
+                'sand': QColor('#ff9800'),
+                'land': QColor('#2196f3'),
+                'mine_bg': QColor('#ff5722'),
+                'text_base': QColor('#0d2137')
+            },
+            'Retro': {
+                'bg': QColor('#0d0d0d'),
+                'sea': QColor('#1a0a2e'),
+                'sand': QColor('#39ff14'),
+                'land': QColor('#2d1b4e'),
+                'mine_bg': QColor('#ff073a'),
+                'text_base': QColor('#39ff14')
+            },
+            'Sakura': {
+                'bg': QColor('#2d1320'),
+                'sea': QColor('#fce4ec'),
+                'sand': QColor('#f8bbd0'),
+                'land': QColor('#e91e8c'),
+                'mine_bg': QColor('#880e4f'),
+                'text_base': QColor('#4a0028')
+            },
+            'Arctic': {
+                'bg': QColor('#0a1628'),
+                'sea': QColor('#e3f2fd'),
+                'sand': QColor('#b3e5fc'),
+                'land': QColor('#4682b4'),
+                'mine_bg': QColor('#d32f2f'),
+                'text_base': QColor('#0d47a1')
+            },
+            'Sunset': {
+                'bg': QColor('#1a0533'),
+                'sea': QColor('#ffdab9'),
+                'sand': QColor('#ff7043'),
+                'land': QColor('#7b1fa2'),
+                'mine_bg': QColor('#b71c1c'),
+                'text_base': QColor('#3e0066')
+            },
+            'Hacker': {
+                'bg': QColor('#0a0a0a'),
+                'sea': QColor('#0a1a0a'),
+                'sand': QColor('#0f3b0f'),
+                'land': QColor('#1a1a1a'),
+                'mine_bg': QColor('#cc0000'),
+                'text_base': QColor('#00ff41')
+            },
         }
         # 数字ごとの色（1=青, 2=緑...）
         self.num_colors = [Qt.black, QColor('#0000FF'), QColor('#008000'), QColor('#FF0000'),
@@ -268,50 +323,42 @@ class BoardWidget(QWidget):
             self.overlay_label.move(0, 0)
 
     def paintEvent(self, event):
-        """
-        【重要】描画処理のメイン部分
-        ここでマス目、数字、爆弾などをすべて描画する
-        """
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, False) # ドット感を出すためアンチエイリアスOFF
-        
-        # 背景塗りつぶし
+        painter.setRenderHint(QPainter.Antialiasing, False)
+
         theme_cols = self.colors.get(self.theme, self.colors['Modern'])
         painter.fillRect(self.rect(), theme_cols['bg'])
-        
+
         if not self.cells: return
 
-        # --- アスペクト比 1:1 の計算 ---
         avail_w = self.width()
         avail_h = self.height()
         padding = 10
-        
-        # 縦横どちらが制限になるか計算して、セルサイズを決定
-        sz_w = (avail_w - padding * 2) / self.grid_w
-        sz_h = (avail_h - padding * 2) / self.grid_h
-        self.cell_size = int(min(sz_w, sz_h))
-        if self.cell_size < 1: self.cell_size = 1
-        
-        # 全体のサイズから描画開始位置（オフセット）を計算して中央寄せ
+
+        base_sz_w = (avail_w - padding * 2) / self.grid_w
+        base_sz_h = (avail_h - padding * 2) / self.grid_h
+        base_cell = max(1, int(min(base_sz_w, base_sz_h)))
+        self.cell_size = max(1, int(base_cell * self.zoom))
+
         total_w = self.cell_size * self.grid_w
         total_h = self.cell_size * self.grid_h
-        self.offset_x = (avail_w - total_w) // 2
-        self.offset_y = (avail_h - total_h) // 2
-        
-        # フォントサイズ調整
-        font_size = int(self.cell_size * 0.6)
+        self.offset_x = (avail_w - total_w) // 2 + self.pan_x
+        self.offset_y = (avail_h - total_h) // 2 + self.pan_y
+
+        font_size = max(1, int(self.cell_size * 0.6))
         font_fam = "Courier New" if self.theme == 'Classic' else "Arial"
-        font = QFont(font_fam, font_size, QFont.Bold)
-        painter.setFont(font)
-        
-        # --- 全セル描画ループ ---
+        painter.setFont(QFont(font_fam, font_size, QFont.Bold))
+
         for y in range(self.grid_h):
             for x in range(self.grid_w):
                 cell = self.cells[y][x]
                 rx = self.offset_x + x * self.cell_size
                 ry = self.offset_y + y * self.cell_size
                 size = self.cell_size
-                
+
+                if rx + size < 0 or ry + size < 0 or rx > avail_w or ry > avail_h:
+                    continue
+
                 if self.theme == 'Classic':
                     self.draw_classic(painter, rx, ry, size, cell, theme_cols, font_size)
                 else:
@@ -379,14 +426,42 @@ class BoardWidget(QWidget):
                 p.setPen(Qt.red)
                 p.drawText(rect, Qt.AlignCenter, "P")
 
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        old_zoom = self.zoom
+        if delta > 0:
+            self.zoom = min(self.zoom * 1.15, 20.0)
+        else:
+            self.zoom = max(self.zoom / 1.15, 0.1)
+        # ズーム中心をマウス位置に
+        mx = event.position().x()
+        my = event.position().y()
+        ratio = self.zoom / old_zoom
+        self.pan_x = int(mx - ratio * (mx - self.pan_x))
+        self.pan_y = int(my - ratio * (my - self.pan_y))
+        self.update()
+
     def mousePressEvent(self, event: QMouseEvent):
-        """クリックされた座標をグリッド座標に変換して通知"""
-        if self.parent_logic:
+        if event.button() == Qt.MiddleButton or event.button() == Qt.RightButton:
+            self._dragging = True
+            self._drag_start = (event.position().x() - self.pan_x, event.position().y() - self.pan_y)
+            return
+        if self.parent_logic and event.button() == Qt.LeftButton:
             x = int((event.position().x() - self.offset_x) // self.cell_size)
             y = int((event.position().y() - self.offset_y) // self.cell_size)
-            # 有効範囲内なら処理へ
             if 0 <= x < self.grid_w and 0 <= y < self.grid_h:
                 self.parent_logic.on_cell_clicked(x, y)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging and self._drag_start:
+            self.pan_x = int(event.position().x() - self._drag_start[0])
+            self.pan_y = int(event.position().y() - self._drag_start[1])
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MiddleButton or event.button() == Qt.RightButton:
+            self._dragging = False
+            self._drag_start = None
 
 # ==========================================
 # メインウィンドウ (ゲームロジック)
@@ -467,7 +542,7 @@ class LuckSweeperWindow(QMainWindow):
         self.lbl_theme = QLabel()
         vl.addWidget(self.lbl_theme)
         self.combo_theme = QComboBox()
-        self.combo_theme.addItems(["Modern", "Sea", "Classic"])
+        self.combo_theme.addItems(["Modern", "Sea", "Classic", "Brazil", "Hoover", "Retro", "Sakura", "Arctic", "Sunset", "Hacker"])
         self.combo_theme.currentTextChanged.connect(self.change_theme)
         vl.addWidget(self.combo_theme)
         self.chk_detail = QCheckBox()
@@ -489,7 +564,7 @@ class LuckSweeperWindow(QMainWindow):
         self.lbl_speed = QLabel()
         bl.addWidget(self.lbl_speed)
         self.slider_speed = QSlider(Qt.Horizontal)
-        self.slider_speed.setRange(10, 800)
+        self.slider_speed.setRange(1, 800)
         self.slider_speed.setValue(self.bot_delay)
         self.slider_speed.setInvertedAppearance(True) # 左＝遅い、右＝速い（delay小）に見せるため反転
         self.slider_speed.valueChanged.connect(self.change_speed)
@@ -502,7 +577,22 @@ class LuckSweeperWindow(QMainWindow):
         self.btn_reset.clicked.connect(self.restart_game)
         ml.addWidget(self.btn_reset)
         
+        # エラー表示ラベル
+        self.lbl_error = QLabel()
+        self.lbl_error.setAlignment(Qt.AlignCenter)
+        self.lbl_error.setWordWrap(True)
+        self.lbl_error.setStyleSheet("color: #e74c3c; font-weight: bold; padding: 5px;")
+        self.lbl_error.hide()
+        ml.addWidget(self.lbl_error)
+
         ml.addStretch()
+
+        # 爆弾残数表示
+        self.lbl_mines = QLabel()
+        self.lbl_mines.setAlignment(Qt.AlignCenter)
+        self.lbl_mines.setStyleSheet("padding: 5px; font-size: 13px;")
+        ml.addWidget(self.lbl_mines)
+
         # ステータスバー
         self.status_bar = QLabel()
         self.status_bar.setAlignment(Qt.AlignCenter)
@@ -700,16 +790,30 @@ class LuckSweeperWindow(QMainWindow):
 
     def restart_game(self):
         """ゲームのリセット・開始処理"""
+        self.lbl_error.hide()
         # メイン設定の読み込み
         try:
             w = int(self.tf_w.text())
             h = int(self.tf_h.text())
             b = int(self.tf_b.text())
-            # 範囲制限（クラッシュ防止のため上限128）
-            self.grid_w = max(2, min(w, 128))
-            self.grid_h = max(2, min(h, 128))
-            self.bomb_ratio = max(1, min(b, 99)) / 100.0
-        except: pass
+            errors = []
+            if w < 2 or w > 200:
+                errors.append(f"幅は2〜200 (入力: {w})")
+            if h < 2 or h > 200:
+                errors.append(f"高さは2〜200 (入力: {h})")
+            if b < 1 or b > 99:
+                errors.append(f"爆弾%は1〜99 (入力: {b})")
+            if errors:
+                self.lbl_error.setText('\n'.join(errors))
+                self.lbl_error.show()
+                return
+            self.grid_w = w
+            self.grid_h = h
+            self.bomb_ratio = b / 100.0
+        except ValueError:
+            self.lbl_error.setText("数値を入力してください")
+            self.lbl_error.show()
+            return
         
         # 機能設定の読み込み
         try:
@@ -724,15 +828,13 @@ class LuckSweeperWindow(QMainWindow):
         self.is_thinking = False
         self.first_click = True
         self.board_view.hide_overlay()
+        self.board_view.zoom = 1.0
+        self.board_view.pan_x = 0
+        self.board_view.pan_y = 0
         self.board_view.set_grid_size(self.grid_w, self.grid_h)
         
         # 盤面データの初期化
-        self.board_view.cells = []
-        for y in range(self.grid_h):
-            row = []
-            for x in range(self.grid_w):
-                row.append({'is_mine': False, 'revealed': False, 'flagged': False, 'neighbor': 0})
-            self.board_view.cells.append(row)
+        self.board_view.cells = [[{'is_mine': False, 'revealed': False, 'flagged': False, 'neighbor': 0} for _ in range(self.grid_w)] for _ in range(self.grid_h)]
             
         total = self.grid_w * self.grid_h
         self.num_mines = max(1, int(total * self.bomb_ratio))
@@ -762,6 +864,7 @@ class LuckSweeperWindow(QMainWindow):
                     self.board_view.cells[y][x]['neighbor'] = c
                     
         self.update_status('ready')
+        self.update_mine_count()
         self.board_view.update()
 
     def ensure_safe_first_click(self, cx, cy):
@@ -831,24 +934,36 @@ class LuckSweeperWindow(QMainWindow):
                 QTimer.singleShot(self.bot_delay, self.auto_step)
 
     def reveal_recursive(self, x, y):
-        """空白（0）のマスをクリックした際、周囲を一気に開ける再帰処理"""
-        cell = self.board_view.cells[y][x]
+        """空白マスの連鎖オープン（スタックベース）"""
+        cells = self.board_view.cells
+        cell = cells[y][x]
         if cell['revealed']: return
-        cell['revealed'] = True
-        
-        if cell['neighbor'] == 0:
-            for dy in [-1,0,1]:
-                for dx in [-1,0,1]:
-                    nx,ny = x+dx, y+dy
-                    if 0<=nx<self.grid_w and 0<=ny<self.grid_h:
-                        if not self.board_view.cells[ny][nx]['revealed']:
-                            self.reveal_recursive(nx, ny)
+        stack = [(x, y)]
+        while stack:
+            cx, cy = stack.pop()
+            c = cells[cy][cx]
+            if c['revealed']: continue
+            c['revealed'] = True
+            if c['neighbor'] == 0:
+                for dy in [-1,0,1]:
+                    for dx in [-1,0,1]:
+                        if dx==0 and dy==0: continue
+                        nx,ny = cx+dx, cy+dy
+                        if 0<=nx<self.grid_w and 0<=ny<self.grid_h:
+                            if not cells[ny][nx]['revealed']:
+                                stack.append((nx,ny))
+
+    def update_mine_count(self):
+        """爆弾残数（地雷数 - フラグ数）を表示"""
+        flag_count = sum(c['flagged'] for r in self.board_view.cells for c in r)
+        self.lbl_mines.setText(f"💣 : {flag_count}/{self.num_mines}")
 
     def set_flag(self, x, y):
         """ボットがフラグを立てる処理"""
         cell = self.board_view.cells[y][x]
         if cell['revealed'] or cell['flagged']: return
         cell['flagged'] = True
+        self.update_mine_count()
         self.check_flags_completion()
         self.board_view.update()
 
