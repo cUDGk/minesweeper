@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "lucksweeper"
 version = "1.0.0"
-description = "PySide6製のAI自動プレイ機能付きマインスイーパ"
+description = "論理ソルバー+確率推測で運の部分だけプレイヤーに回すマインスイーパー"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [
-    {name = "にぱ"}
+    {name = "cUDGk"}
 ]
 keywords = ["game", "minesweeper", "gui", "pyside6", "qt"]
 dependencies = [
@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/lucksweeper"
+Homepage = "https://github.com/cUDGk/minesweeper"
 
 # もしスクリプトをパッケージ化してコマンドラインから起動したい場合は以下を有効化
 # (ファイル名が main.py で、main関数がある場合)

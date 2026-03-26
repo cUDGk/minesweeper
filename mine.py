@@ -1,6 +1,7 @@
 import sys
 import os
 import random
+from itertools import combinations
 
 # --- PySide6 ライブラリのインポート ---
 # GUI構築に必要なウィジェット群
@@ -721,6 +722,7 @@ class LuckSweeperWindow(QMainWindow):
         # 状態リセット
         self.game_over = False
         self.is_thinking = False
+        self.first_click = True
         self.board_view.hide_overlay()
         self.board_view.set_grid_size(self.grid_w, self.grid_h)
         
@@ -762,18 +764,59 @@ class LuckSweeperWindow(QMainWindow):
         self.update_status('ready')
         self.board_view.update()
 
+    def ensure_safe_first_click(self, cx, cy):
+        """初手安全保証: クリック位置とその周囲から地雷を移動"""
+        cells = self.board_view.cells
+        safe_zone = set()
+        for dy in range(-1, 2):
+            for dx in range(-1, 2):
+                nx, ny = cx+dx, cy+dy
+                if 0<=nx<self.grid_w and 0<=ny<self.grid_h:
+                    safe_zone.add((nx, ny))
+
+        moved = []
+        for (sx, sy) in safe_zone:
+            if cells[sy][sx]['is_mine']:
+                cells[sy][sx]['is_mine'] = False
+                moved.append((sx, sy))
+
+        for _ in moved:
+            while True:
+                rx = random.randint(0, self.grid_w-1)
+                ry = random.randint(0, self.grid_h-1)
+                if (rx,ry) not in safe_zone and not cells[ry][rx]['is_mine']:
+                    cells[ry][rx]['is_mine'] = True
+                    break
+
+        if moved:
+            for y in range(self.grid_h):
+                for x in range(self.grid_w):
+                    if not cells[y][x]['is_mine']:
+                        c = 0
+                        for dy in [-1,0,1]:
+                            for dx in [-1,0,1]:
+                                if dx==0 and dy==0: continue
+                                nx,ny = x+dx,y+dy
+                                if 0<=nx<self.grid_w and 0<=ny<self.grid_h:
+                                    if cells[ny][nx]['is_mine']: c+=1
+                        cells[y][x]['neighbor'] = c
+
     def on_cell_clicked(self, cx, cy):
         """セルがクリックされた時の処理"""
         if self.game_over:
             self.restart_game()
             return
-        if self.is_thinking: return # ボット思考中は無視
-        
+        if self.is_thinking: return
+
         cell = self.board_view.cells[cy][cx]
         if cell['revealed'] or cell['flagged']: return
-        
+
+        if self.first_click:
+            self.first_click = False
+            self.ensure_safe_first_click(cx, cy)
+            cell = self.board_view.cells[cy][cx]
+
         if cell['is_mine']:
-            # 爆発
             cell['revealed'] = True
             self.game_over_seq(False)
         else:
@@ -827,20 +870,16 @@ class LuckSweeperWindow(QMainWindow):
         h = sum(1 for r in self.board_view.cells for c in r if not c['revealed'] and not c['is_mine'])
         if h == 0: self.game_over_seq(True)
 
-    def auto_step(self):
-        """ボットの思考ルーチン"""
-        if self.game_over: return
-        
-        candidates = []
+    def get_constraints(self):
+        """盤面から制約リストを生成: (残り地雷数, 未開放セル集合) のリスト"""
+        constraints = []
         cells = self.board_view.cells
-        
-        # 全セルをスキャンして論理的に確定する場所を探す
         for y in range(self.grid_h):
             for x in range(self.grid_w):
                 c = cells[y][x]
                 if c['revealed'] and c['neighbor'] > 0:
-                    unk = [] # 周囲の未開放セル
-                    flg = 0  # 周囲のフラグ数
+                    unk = set()
+                    flg = 0
                     for dy in [-1,0,1]:
                         for dx in [-1,0,1]:
                             if dx==0 and dy==0: continue
@@ -848,53 +887,204 @@ class LuckSweeperWindow(QMainWindow):
                             if 0<=nx<self.grid_w and 0<=ny<self.grid_h:
                                 nc = cells[ny][nx]
                                 if nc['flagged']: flg+=1
-                                elif not nc['revealed']: unk.append((nx,ny))
-                    
-                    if not unk: continue
+                                elif not nc['revealed']: unk.add((nx,ny))
+                    if unk:
+                        remaining = c['neighbor'] - flg
+                        if remaining >= 0:
+                            constraints.append((remaining, unk))
+        return constraints
 
-                    # ロジックA: 残り未開放数 == 数字 - 旗数 -> すべて爆弾（フラグ）
-                    if c['neighbor'] == flg + len(unk):
-                        for tx, ty in unk:
-                            # Island戦略の場合、角（周囲が海）のスコアを計算
-                            score = self.count_revealed_neighbors(tx, ty) if self.bot_strategy == 'Island' else 0
-                            candidates.append({'score': score, 'type': 'flag', 'x': tx, 'y': ty})
+    def solve_basic(self, constraints):
+        """基本制約: 単一セルの論理で確定するセルを返す"""
+        safe = set()
+        mines = set()
+        for remaining, unk in constraints:
+            if remaining == 0:
+                safe |= unk
+            elif remaining == len(unk):
+                mines |= unk
+        return safe, mines
 
-                    # ロジックB: 数字 == 旗数 -> 残りすべて安全（オープン）
-                    elif c['neighbor'] == flg:
-                        for tx, ty in unk:
-                            score = self.count_revealed_neighbors(tx, ty) if self.bot_strategy == 'Island' else 0
-                            candidates.append({'score': score, 'type': 'reveal', 'x': tx, 'y': ty})
-        
-        if candidates:
-            # 重複除去
-            unique_c = []
-            seen = set()
-            for cand in candidates:
-                key = (cand['type'], cand['x'], cand['y'])
-                if key not in seen:
-                    seen.add(key)
-                    unique_c.append(cand)
+    def solve_subset(self, constraints):
+        """サブセット制約解析: 2つの制約間の包含関係から推論"""
+        safe = set()
+        mines = set()
+        for i in range(len(constraints)):
+            ri, si = constraints[i]
+            for j in range(len(constraints)):
+                if i == j: continue
+                rj, sj = constraints[j]
+                if si <= sj:
+                    diff = sj - si
+                    rdiff = rj - ri
+                    if rdiff == 0:
+                        safe |= diff
+                    elif rdiff == len(diff):
+                        mines |= diff
+        return safe, mines
 
-            # Island戦略ならスコア順（角を優先）にソート
-            if self.bot_strategy == 'Island':
-                unique_c.sort(key=lambda item: item['score'], reverse=True)
-            
-            # 候補の先頭を実行
-            action = unique_c[0]
-            if action['type'] == 'flag':
-                self.set_flag(action['x'], action['y'])
-            else:
-                self.reveal_recursive(action['x'], action['y'])
-                self.board_view.update()
-            
+    def get_frontier_cells(self):
+        """フロンティア（数字セルに隣接する未開放セル）を取得"""
+        cells = self.board_view.cells
+        frontier = set()
+        for y in range(self.grid_h):
+            for x in range(self.grid_w):
+                c = cells[y][x]
+                if not c['revealed'] and not c['flagged']:
+                    for dy in [-1,0,1]:
+                        for dx in [-1,0,1]:
+                            if dx==0 and dy==0: continue
+                            nx,ny = x+dx,y+dy
+                            if 0<=nx<self.grid_w and 0<=ny<self.grid_h:
+                                nc = cells[ny][nx]
+                                if nc['revealed'] and nc['neighbor'] > 0:
+                                    frontier.add((x,y))
+                                    break
+                        else:
+                            continue
+                        break
+        return frontier
+
+    def solve_csp(self, constraints):
+        """CSPバックトラッキングソルバー: フロンティアの全有効配置を列挙して確定セルを発見"""
+        frontier = self.get_frontier_cells()
+        if not frontier or len(frontier) > 25:
+            return set(), set(), {}
+
+        frontier_list = sorted(frontier)
+        cell_idx = {cell: i for i, cell in enumerate(frontier_list)}
+
+        relevant = []
+        for remaining, unk in constraints:
+            filtered = unk & frontier
+            if filtered:
+                indices = frozenset(cell_idx[c] for c in filtered)
+                relevant.append((remaining, indices))
+
+        n = len(frontier_list)
+        mine_count = [0] * n
+        total_configs = 0
+
+        def backtrack(pos, assignment):
+            nonlocal total_configs
+            for rem, indices in relevant:
+                assigned_mines = sum(1 for i in indices if i < pos and assignment[i])
+                remaining_in_constraint = sum(1 for i in indices if i >= pos)
+                assigned_safe = sum(1 for i in indices if i < pos and not assignment[i])
+                total_in_constraint = len(indices)
+                if assigned_mines > rem:
+                    return
+                if rem - assigned_mines > remaining_in_constraint:
+                    return
+
+            if pos == n:
+                for rem, indices in relevant:
+                    if sum(assignment[i] for i in indices) != rem:
+                        return
+                total_configs += 1
+                for i in range(n):
+                    if assignment[i]:
+                        mine_count[i] += 1
+                return
+
+            assignment[pos] = False
+            backtrack(pos + 1, assignment)
+            assignment[pos] = True
+            backtrack(pos + 1, assignment)
+
+        assignment = [False] * n
+        backtrack(0, assignment)
+
+        safe = set()
+        mines_set = set()
+        probabilities = {}
+
+        if total_configs > 0:
+            for i in range(n):
+                prob = mine_count[i] / total_configs
+                probabilities[frontier_list[i]] = prob
+                if mine_count[i] == 0:
+                    safe.add(frontier_list[i])
+                elif mine_count[i] == total_configs:
+                    mines_set.add(frontier_list[i])
+
+        return safe, mines_set, probabilities
+
+    def auto_step(self):
+        """ボットの思考ルーチン（3段階ソルバー + 確率推測）"""
+        if self.game_over: return
+
+        constraints = self.get_constraints()
+
+        # Stage 1: 基本制約
+        safe, mines = self.solve_basic(constraints)
+
+        # Stage 2: サブセット制約解析
+        if not safe and not mines:
+            safe, mines = self.solve_subset(constraints)
+
+        # Stage 3: CSPソルバー
+        probabilities = {}
+        if not safe and not mines:
+            safe, mines, probabilities = self.solve_csp(constraints)
+
+        # フラグ処理
+        for (mx, my) in mines:
+            self.set_flag(mx, my)
+
+        # 安全セルを開く
+        for (sx, sy) in safe:
+            cell = self.board_view.cells[sy][sx]
+            if not cell['revealed'] and not cell['flagged']:
+                self.reveal_recursive(sx, sy)
+
+        if safe or mines:
+            self.board_view.update()
             self.check_win()
             if not self.game_over:
                 QTimer.singleShot(self.bot_delay, self.auto_step)
-        else:
-            # 手詰まり -> 人間にパス
-            self.is_thinking = False
-            self.update_status('human')
+            return
+
+        # Stage 4: 確率ベース推測
+        if probabilities:
+            best_cell = min(probabilities, key=probabilities.get)
+            prob = probabilities[best_cell]
+            bx, by = best_cell
+            cell = self.board_view.cells[by][bx]
+            if not cell['revealed'] and not cell['flagged']:
+                if prob >= 1.0:
+                    self.set_flag(bx, by)
+                else:
+                    self.reveal_recursive(bx, by)
+                self.board_view.update()
+                self.check_win()
+                if not self.game_over:
+                    QTimer.singleShot(self.bot_delay, self.auto_step)
+                return
+
+        # フロンティア外の未開放セルがあれば最も孤立したものを選ぶ
+        cells = self.board_view.cells
+        frontier = self.get_frontier_cells()
+        non_frontier = []
+        for y in range(self.grid_h):
+            for x in range(self.grid_w):
+                c = cells[y][x]
+                if not c['revealed'] and not c['flagged'] and (x,y) not in frontier:
+                    non_frontier.append((x,y))
+
+        if non_frontier:
+            choice = random.choice(non_frontier)
+            self.reveal_recursive(choice[0], choice[1])
             self.board_view.update()
+            self.check_win()
+            if not self.game_over:
+                QTimer.singleShot(self.bot_delay, self.auto_step)
+            return
+
+        # 手詰まり → 人間にパス
+        self.is_thinking = False
+        self.update_status('human')
+        self.board_view.update()
 
     def count_revealed_neighbors(self, x, y):
         """周囲の「開放済みマス（海）」の数を数える。多いほど「角」や「半島」である可能性が高い"""
