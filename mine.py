@@ -11,9 +11,10 @@ from PySide6.QtWidgets import (
     QSlider, QGraphicsOpacityEffect, QGroupBox, QTabWidget, QTextEdit
 )
 # アニメーション、タイマー、座標管理など
-from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QRect, QUrl
+from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QRect, QUrl, Signal, QThread, QObject
 # 描画（ペン、ブラシ、フォント）
-from PySide6.QtGui import QPainter, QColor, QFont, QPen, QMouseEvent
+from PySide6.QtGui import QPainter, QColor, QFont, QPen, QMouseEvent, QPolygon
+from PySide6.QtCore import QPoint
 from PySide6.QtMultimedia import QSoundEffect
 
 # ==========================================
@@ -123,6 +124,138 @@ The first click is always safe.</p>
 # ==========================================
 # サウンド管理クラス
 # ==========================================
+# ==========================================
+# ボット思考ワーカー（別スレッド）
+# ==========================================
+class BotThread(QThread):
+    result_ready = Signal(set, set, dict)
+
+    def __init__(self):
+        super().__init__()
+        self.grid_w = 0
+        self.grid_h = 0
+        self.cells_snapshot = None
+
+    def set_data(self, grid_w, grid_h, cells):
+        self.grid_w = grid_w
+        self.grid_h = grid_h
+        self.cells_snapshot = [
+            [{'revealed': c['revealed'], 'flagged': c['flagged'],
+              'neighbor': c['neighbor'], 'is_mine': c['is_mine']}
+             for c in row] for row in cells
+        ]
+
+    def run(self):
+        cells = self.cells_snapshot
+        w, h = self.grid_w, self.grid_h
+
+        constraints = []
+        for y in range(h):
+            for x in range(w):
+                c = cells[y][x]
+                if c['revealed'] and c['neighbor'] > 0:
+                    unk = set()
+                    flg = 0
+                    for dy in [-1,0,1]:
+                        for dx in [-1,0,1]:
+                            if dx==0 and dy==0: continue
+                            nx,ny = x+dx,y+dy
+                            if 0<=nx<w and 0<=ny<h:
+                                nc = cells[ny][nx]
+                                if nc['flagged']: flg+=1
+                                elif not nc['revealed']: unk.add((nx,ny))
+                    if unk:
+                        remaining = c['neighbor'] - flg
+                        if remaining >= 0:
+                            constraints.append((remaining, unk))
+
+        safe = set()
+        mines = set()
+        for remaining, unk in constraints:
+            if remaining == 0:
+                safe |= unk
+            elif remaining == len(unk):
+                mines |= unk
+
+        if not safe and not mines:
+            for i in range(len(constraints)):
+                ri, si = constraints[i]
+                for j in range(len(constraints)):
+                    if i == j: continue
+                    rj, sj = constraints[j]
+                    if si <= sj:
+                        diff = sj - si
+                        rdiff = rj - ri
+                        if rdiff == 0:
+                            safe |= diff
+                        elif rdiff == len(diff):
+                            mines |= diff
+
+        probabilities = {}
+        if not safe and not mines:
+            frontier = set()
+            for y in range(h):
+                for x in range(w):
+                    c = cells[y][x]
+                    if not c['revealed'] and not c['flagged']:
+                        found = False
+                        for dy in [-1,0,1]:
+                            for dx in [-1,0,1]:
+                                if dx==0 and dy==0: continue
+                                nx2,ny2 = x+dx,y+dy
+                                if 0<=nx2<w and 0<=ny2<h:
+                                    nc2 = cells[ny2][nx2]
+                                    if nc2['revealed'] and nc2['neighbor'] > 0:
+                                        found = True; break
+                            if found: break
+                        if found:
+                            frontier.add((x,y))
+
+            if frontier and len(frontier) <= 25:
+                frontier_list = sorted(frontier)
+                cell_idx = {c2: i for i, c2 in enumerate(frontier_list)}
+                relevant = []
+                for remaining, unk in constraints:
+                    filtered = unk & frontier
+                    if filtered:
+                        indices = frozenset(cell_idx[c2] for c2 in filtered)
+                        relevant.append((remaining, indices))
+
+                n = len(frontier_list)
+                mine_count = [0] * n
+                total_configs = [0]
+
+                def backtrack(pos, assignment):
+                    for rem, indices in relevant:
+                        assigned_mines = sum(1 for i2 in indices if i2 < pos and assignment[i2])
+                        remaining_in = sum(1 for i2 in indices if i2 >= pos)
+                        if assigned_mines > rem: return
+                        if rem - assigned_mines > remaining_in: return
+                    if pos == n:
+                        for rem, indices in relevant:
+                            if sum(assignment[i2] for i2 in indices) != rem: return
+                        total_configs[0] += 1
+                        for i2 in range(n):
+                            if assignment[i2]: mine_count[i2] += 1
+                        return
+                    assignment[pos] = False
+                    backtrack(pos + 1, assignment)
+                    assignment[pos] = True
+                    backtrack(pos + 1, assignment)
+
+                backtrack(0, [False] * n)
+                if total_configs[0] > 0:
+                    for i in range(n):
+                        prob = mine_count[i] / total_configs[0]
+                        probabilities[frontier_list[i]] = prob
+                        if mine_count[i] == 0:
+                            safe.add(frontier_list[i])
+                        elif mine_count[i] == total_configs[0]:
+                            mines.add(frontier_list[i])
+
+        self.result_ready.emit(safe, mines, probabilities)
+
+
 class SoundManager:
     """
     音声ファイルの読み込みと再生を担当。
@@ -177,10 +310,14 @@ class BoardWidget(QWidget):
         self.pan_y = 0
         self._dragging = False
         self._drag_start = None
-        
+
+        # ヒント矢印
+        self.hint_cell = None  # (x, y) or None
+        self.hint_prob = None  # 地雷確率
+
         # 表示設定
-        self.theme = 'Modern' 
-        self.show_details = True # 数字や旗を表示するかどうか
+        self.theme = 'Modern'
+        self.show_details = True
         
         # アニメーション設定
         self.overlay_anim_duration = 500
@@ -364,6 +501,33 @@ class BoardWidget(QWidget):
                 else:
                     self.draw_modern_sea(painter, rx, ry, size, cell, theme_cols, font_size)
 
+        # ヒント矢印描画
+        if self.hint_cell:
+            hx, hy = self.hint_cell
+            cx = self.offset_x + hx * self.cell_size + self.cell_size // 2
+            cy = self.offset_y + hy * self.cell_size - self.cell_size // 3
+            arrow_h = max(8, self.cell_size // 2)
+            arrow_w = max(6, self.cell_size // 3)
+
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.setBrush(QColor('#00e676'))
+            painter.setPen(QPen(QColor('#00c853'), 2))
+            triangle = QPolygon([
+                QPoint(cx, cy + arrow_h),
+                QPoint(cx - arrow_w, cy),
+                QPoint(cx + arrow_w, cy),
+            ])
+            painter.drawPolygon(triangle)
+            # 確率テキスト
+            if self.hint_prob is not None and self.cell_size >= 10:
+                pct = int(self.hint_prob * 100)
+                painter.setPen(QColor('#00e676'))
+                f = QFont("Arial", max(8, self.cell_size // 3), QFont.Bold)
+                painter.setFont(f)
+                painter.drawText(QRect(cx - 30, cy - max(12, self.cell_size // 3), 60, max(12, self.cell_size // 3)),
+                                 Qt.AlignCenter, f"{pct}%")
+            painter.setRenderHint(QPainter.Antialiasing, False)
+
     def draw_modern_sea(self, p, x, y, s, cell, cols, fs):
         """モダン / 海モードの描画"""
         gap = 0 if s < 5 else 1 # 小さすぎる時は隙間をなくす
@@ -431,14 +595,35 @@ class BoardWidget(QWidget):
         old_zoom = self.zoom
         if delta > 0:
             self.zoom = min(self.zoom * 1.15, 20.0)
-        else:
+        elif delta < 0:
             self.zoom = max(self.zoom / 1.15, 0.1)
-        # ズーム中心をマウス位置に
+        else:
+            return
+
         mx = event.position().x()
         my = event.position().y()
-        ratio = self.zoom / old_zoom
-        self.pan_x = int(mx - ratio * (mx - self.pan_x))
-        self.pan_y = int(my - ratio * (my - self.pan_y))
+
+        avail_w = self.width()
+        avail_h = self.height()
+        padding = 10
+        base_cell = max(1, int(min((avail_w - padding*2) / self.grid_w,
+                                    (avail_h - padding*2) / self.grid_h)))
+
+        old_cs = max(1, int(base_cell * old_zoom))
+        new_cs = max(1, int(base_cell * self.zoom))
+
+        # ズーム前のマウス下グリッド座標
+        old_cx = (avail_w - old_cs * self.grid_w) // 2
+        old_cy = (avail_h - old_cs * self.grid_h) // 2
+        grid_x = (mx - old_cx - self.pan_x) / old_cs
+        grid_y = (my - old_cy - self.pan_y) / old_cs
+
+        # ズーム後に同じグリッド座標が同じ画面位置に来るようpan調整
+        new_cx = (avail_w - new_cs * self.grid_w) // 2
+        new_cy = (avail_h - new_cs * self.grid_h) // 2
+        self.pan_x = int(mx - new_cx - grid_x * new_cs)
+        self.pan_y = int(my - new_cy - grid_y * new_cs)
+
         self.update()
 
     def mousePressEvent(self, event: QMouseEvent):
@@ -474,6 +659,10 @@ class LuckSweeperWindow(QMainWindow):
         
         self.current_lang = 'jp'
         self.sound_manager = SoundManager()
+
+        # ボットワーカースレッド
+        self.bot_thread = BotThread()
+        self.bot_thread.result_ready.connect(self.on_bot_result)
         
         # ゲームステート初期値
         self.grid_w = 20
@@ -914,6 +1103,9 @@ class LuckSweeperWindow(QMainWindow):
         cell = self.board_view.cells[cy][cx]
         if cell['revealed'] or cell['flagged']: return
 
+        self.board_view.hint_cell = None
+        self.board_view.hint_prob = None
+
         if self.first_click:
             self.first_click = False
             self.ensure_safe_first_click(cx, cy)
@@ -1126,22 +1318,18 @@ class LuckSweeperWindow(QMainWindow):
         return safe, mines_set, probabilities
 
     def auto_step(self):
-        """ボットの思考ルーチン（3段階ソルバー + 確率推測）"""
+        """ボットの思考を別スレッドで実行"""
         if self.game_over: return
+        if self.bot_thread.isRunning(): return
 
-        constraints = self.get_constraints()
+        self.bot_thread.set_data(self.grid_w, self.grid_h, self.board_view.cells)
+        self.bot_thread.start()
 
-        # Stage 1: 基本制約
-        safe, mines = self.solve_basic(constraints)
+    def on_bot_result(self, safe, mines, probabilities):
+        """ワーカースレッドからの結果をメインスレッドで適用"""
+        self.bot_thread.wait()
 
-        # Stage 2: サブセット制約解析
-        if not safe and not mines:
-            safe, mines = self.solve_subset(constraints)
-
-        # Stage 3: CSPソルバー
-        probabilities = {}
-        if not safe and not mines:
-            safe, mines, probabilities = self.solve_csp(constraints)
+        if self.game_over: return
 
         # フラグ処理
         for (mx, my) in mines:
@@ -1154,50 +1342,57 @@ class LuckSweeperWindow(QMainWindow):
                 self.reveal_recursive(sx, sy)
 
         if safe or mines:
+            self.board_view.hint_cell = None
+            self.board_view.hint_prob = None
             self.board_view.update()
             self.check_win()
             if not self.game_over:
                 QTimer.singleShot(self.bot_delay, self.auto_step)
             return
 
-        # Stage 4: 確率ベース推測
-        if probabilities:
-            best_cell = min(probabilities, key=probabilities.get)
-            prob = probabilities[best_cell]
-            bx, by = best_cell
-            cell = self.board_view.cells[by][bx]
-            if not cell['revealed'] and not cell['flagged']:
-                if prob >= 1.0:
-                    self.set_flag(bx, by)
-                else:
-                    self.reveal_recursive(bx, by)
-                self.board_view.update()
-                self.check_win()
-                if not self.game_over:
-                    QTimer.singleShot(self.bot_delay, self.auto_step)
-                return
-
-        # フロンティア外の未開放セルがあれば最も孤立したものを選ぶ
-        cells = self.board_view.cells
-        frontier = self.get_frontier_cells()
-        non_frontier = []
-        for y in range(self.grid_h):
-            for x in range(self.grid_w):
-                c = cells[y][x]
-                if not c['revealed'] and not c['flagged'] and (x,y) not in frontier:
-                    non_frontier.append((x,y))
-
-        if non_frontier:
-            choice = random.choice(non_frontier)
-            self.reveal_recursive(choice[0], choice[1])
-            self.board_view.update()
-            self.check_win()
-            if not self.game_over:
-                QTimer.singleShot(self.bot_delay, self.auto_step)
-            return
-
-        # 手詰まり → 人間にパス
+        # 論理で確定しない → 人間にパス + ヒント矢印
         self.is_thinking = False
+
+        # ヒント: 確率情報があれば最も安全なセルを矢印で示す
+        if probabilities:
+            best = min(probabilities, key=probabilities.get)
+            self.board_view.hint_cell = best
+            self.board_view.hint_prob = probabilities[best]
+        else:
+            # CSPが使えなかった場合、フロンティアからランダムに1つ指す
+            frontier = self.get_frontier_cells()
+            if frontier:
+                pick = random.choice(list(frontier))
+                self.board_view.hint_cell = pick
+                self.board_view.hint_prob = None
+            else:
+                # フロンティアもない → 未開放セルからランダム
+                cells = self.board_view.cells
+                unrevealed = []
+                for y in range(self.grid_h):
+                    for x in range(self.grid_w):
+                        c = cells[y][x]
+                        if not c['revealed'] and not c['flagged']:
+                            unrevealed.append((x,y))
+                if unrevealed:
+                    pick = random.choice(unrevealed)
+                    self.board_view.hint_cell = pick
+                    self.board_view.hint_prob = None
+                else:
+                    self.board_view.hint_cell = None
+                    self.board_view.hint_prob = None
+
+        # ヒントセルがあれば画面中央にスクロール
+        if self.board_view.hint_cell:
+            bv = self.board_view
+            hx, hy = bv.hint_cell
+            target_x = bv.offset_x + hx * bv.cell_size + bv.cell_size // 2
+            target_y = bv.offset_y + hy * bv.cell_size + bv.cell_size // 2
+            center_x = bv.width() // 2
+            center_y = bv.height() // 2
+            bv.pan_x += center_x - target_x
+            bv.pan_y += center_y - target_y
+
         self.update_status('human')
         self.board_view.update()
 
