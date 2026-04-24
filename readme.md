@@ -34,6 +34,24 @@ Python (PySide6) でシュバッと動いちゃう、超生意気マインスイ
 
 ---
 
+## インストール
+
+```bash
+git clone https://github.com/cUDGk/minesweeper.git
+cd minesweeper
+pip install PySide6
+```
+
+## 使い方
+
+```bash
+python mine.py
+```
+
+盤面サイズ・地雷数・テーマ（Modern / Sea / Classic）・Logic Bot の戦略プロファイルは GUI から設定する。
+
+---
+
 ## 開発体制 (Credits)
 
 ### **Lead Architect / Author**: にぱー♡  
@@ -43,3 +61,9 @@ Python (PySide6) でシュバッと動いちゃう、超生意気マインスイ
 ### **Code Assistant**: Gemini (Google)♡  
 コード補完とかリファクタリングとか、裏でコソコソ働くタイプ♡  
 ま、サブキャラって感じ？
+
+---
+
+## ライセンス
+
+[MIT License](LICENSE) -- Copyright (c) 2026 cUDGk
