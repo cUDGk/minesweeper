@@ -3,7 +3,7 @@
 Python (PySide6) でシュバッと動いちゃう、超生意気マインスイーパ・シミュレーターだよ？ 
 こんなの触ったらもう戻れないんだから…覚悟してよねっ♡♡
 
-![Python](https://img.shields.io/badge/Python-3.x-blue.svg)
+![Python](https://img.shields.io/badge/Python-3.11%2B-blue.svg)
 ![PySide6](https://img.shields.io/badge/GUI-PySide6-green.svg)
 
 ## 概要 (Overview)
